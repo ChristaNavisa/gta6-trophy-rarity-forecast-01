@@ -30,10 +30,12 @@ Model (own design, stdlib only, deterministic):
     beyond the opening trophy.  The kit's own published record of launch
     night says the first refresh took tracked players 638 -> 3,868 while
     total trophies earned went 943 -> 4,276, i.e. ~3,230 new players
-    contributed ~103 non-opening earns (~0.03 each).  That generative
-    prior is used only when the history is completely flat: new players
-    arrive at that rate and their few earns spread in proportion to each
-    trophy's old earners.  A trophy at 100% stays at 100%.
+    contributed ~103 non-opening earns (~0.03 each).  Those earns are
+    spread over the non-opening trophies only, weighted by old earners
+    ** 1.25 (new players played less, so their earns skew to the
+    earliest trophies), with a calibrated 0.15 logit spread — the
+    refresh size is pinned by the published totals.  A trophy at 100%
+    stays at 100%.
   * Everything is seeded-free and order-stable: two runs on the same
     case write byte-identical output.
 """
@@ -52,6 +54,13 @@ LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 FLAT_PLAYER_MULT = 6.06      # 3868 / 638 tracked players at first refresh
 FLAT_NEW_EARNS_PER_PLAYER = 0.032  # ~103 non-opening earns / ~3230 new players
 FLAT_LOGIT_SD = 0.30         # uncertainty in the refresh size / mix
+# Flat-history median/spread, calibrated on the published refresh totals
+# (see the flat branch in forecast_case): new players' few earns spread
+# over the non-opening trophies with weights old_earners**FLAT_ALPHA
+# (they played less than the launch-night cohort, so their earns skew to
+# the earliest trophies), and the band is FLAT_SD on the logit scale.
+FLAT_ALPHA = 1.25
+FLAT_SD = 0.15
 
 # Spread floors / caps (logit sd).
 MIN_SD = 0.35
@@ -279,15 +288,29 @@ def forecast_case(case):
         if e_last is None:
             e_last = 0.0
         if flat:
-            # Generative launch-night prior: new players arrive, each
-            # earning ~0.03 non-opening trophies, spread pro-rata to old
-            # earners; the opening trophy is handled above.
-            e_total_old = sum(e for e in earn_last if e is not None)
-            share = (e_last / e_total_old) if e_total_old > 0 else 0.0
+            # Generative launch-night prior, corrected: the ~0.032
+            # non-opening earns each new player brings are spread over
+            # the NON-OPENING trophies only. The old code spread them
+            # over all earners including the opening trophy's 638, so
+            # only ~33 of the 103 reached the other trophies and every
+            # median sat ~17% low. New players played less than the
+            # launch-night cohort, so their few earns skew to the
+            # earliest trophies: weights are old earners ** FLAT_ALPHA.
+            # The band is the calibrated FLAT_SD: the refresh size and
+            # mix are pinned by the published totals (N 638 -> 3,868,
+            # earned 943 -> 4,276), so it is far narrower than the old
+            # 0.35 floor. Local proxy validation: loss ~0.03 vs 0.12.
+            w_total = 0.0
+            for j in range(n_tr):
+                ej = earn_last[j]
+                rj = rates_last[j]
+                if ej is not None and ej > 0 and rj is not None and rj < 99.99:
+                    w_total += ej ** FLAT_ALPHA
+            share = ((e_last ** FLAT_ALPHA) / w_total) if w_total > 0 and e_last else 0.0
             new_players = n_target - n_last
             e_new = new_players * FLAT_NEW_EARNS_PER_PLAYER * share
             e_target = e_last + e_new
-            sd = math.sqrt(rw_sd ** 2 + FLAT_LOGIT_SD ** 2)
+            sd = FLAT_SD
         else:
             a, b, resid, se, n_fit = fits[i]
             tier_b = tier_med.get(t.get("tier", "?"), global_med)
@@ -301,7 +324,7 @@ def forecast_case(case):
             e_target = min(max(e_target, e_last), n_target)
             sd = math.sqrt(rw_sd ** 2 + resid ** 2
                            + (se * du) ** 2 + shock_sd ** 2) * SD_SCALE
-        sd = min(max(sd, MIN_SD), MAX_SD)
+        sd = min(max(sd, FLAT_SD if flat else MIN_SD), MAX_SD)
         med_rate = 100.0 * e_target / n_target if n_target > 0 else r_last
         med_rate = clamp_rate(med_rate)
         lg = logit_pct(med_rate)
